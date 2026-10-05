@@ -108,9 +108,14 @@ struct CameraRegisters {
   };
 };
 
+// Each DMA frame owns complete cache lines; invalidation must not overlap
+// an adjacent frame's CPU-written CSI empty-buffer linked-list pointer.
+constexpr size_t kFramebufferBytes = CameraTask::kHeight * CameraTask::kWidth;
+constexpr size_t kFramebufferStride = (kFramebufferBytes + 63u) & ~size_t{63u};
+static_assert(kFramebufferStride % 64 == 0, "Frame stride must be cache aligned");
 __attribute__((section(".sdram_bss,\"aw\",%nobits @")))
 __attribute__((aligned(64))) uint8_t
-    framebuffers[kFramebufferCount][CameraTask::kHeight][CameraTask::kWidth];
+    framebuffers[kFramebufferCount][kFramebufferStride];
 
 uint8_t* IndexToFramebufferPtr(int index) {
   if (index < 0 || index >= kFramebufferCount) {
