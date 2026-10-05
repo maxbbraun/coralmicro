@@ -17,6 +17,7 @@
 #include "libs/tpu/edgetpu_driver.h"
 
 #include <cassert>
+#include <cstring>
 
 #include "libs/base/check.h"
 #include "libs/tpu/darwinn/driver/config/beagle/beagle_chip_config.h"
@@ -25,6 +26,7 @@
 #include "third_party/freertos_kernel/include/FreeRTOS.h"
 #include "third_party/freertos_kernel/include/semphr.h"
 #include "third_party/nxp/rt1176-sdk/components/osa/fsl_os_abstraction.h"
+#include "third_party/nxp/rt1176-sdk/devices/MIMXRT1176/drivers/cm7/fsl_cache.h"
 #include "third_party/nxp/rt1176-sdk/middleware/usb/include/usb_spec.h"
 
 namespace coralmicro {
@@ -212,6 +214,9 @@ bool TpuDriver::Initialize(usb_host_edgetpu_instance_t *usb_instance,
 
 bool TpuDriver::CSRTransfer(uint64_t reg, void *data, bool read,
                             RegisterSize reg_size) {
+  // USB cache operations affect whole lines. Keep the register payload separate
+  // from other live stack data while DMA is active.
+  alignas(32) uint8_t transfer_buffer[32] = {};
   bool ret = false;
   usb_status_t control_status;
   usb_setup_struct_t setup_packet;
@@ -233,10 +238,13 @@ bool TpuDriver::CSRTransfer(uint64_t reg, void *data, bool read,
   setup_packet.wValue = 0xFFFF & reg;
   setup_packet.wIndex = 0xFFFF & (reg >> 16);
 
+  const size_t payload_size = setup_packet.wLength;
+  if (!read) std::memcpy(transfer_buffer, data, payload_size);
+
   SemaphoreHandle_t sema = xSemaphoreCreateBinary();
 
   control_status = USB_HostEdgeTpuControl(
-      usb_instance_, &setup_packet, (uint8_t *)data,
+      usb_instance_, &setup_packet, transfer_buffer,
       [](void *param, uint8_t *data, uint32_t data_length,
          usb_status_t status) {
         SemaphoreHandle_t sema = (SemaphoreHandle_t)param;
@@ -253,6 +261,12 @@ bool TpuDriver::CSRTransfer(uint64_t reg, void *data, bool read,
     goto exit;
   }
 
+  if (read) {
+    // Discard any cache line filled while DMA was active.
+    DCACHE_InvalidateByRange(reinterpret_cast<uint32_t>(transfer_buffer),
+                            sizeof(transfer_buffer));
+    std::memcpy(data, transfer_buffer, payload_size);
+  }
   ret = true;
 exit:
   vSemaphoreDelete(sema);
