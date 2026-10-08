@@ -21,6 +21,9 @@
 
 #include "libs/base/check.h"
 #include "libs/base/reset.h"
+#include "third_party/freertos_kernel/include/task.h"
+#include "third_party/modified/nxp/rt1176-sdk/usb_device_config.h"
+#include "third_party/nxp/rt1176-sdk/middleware/usb/device/usb_device_dci.h"
 #include "third_party/nxp/rt1176-sdk/middleware/usb/output/source/device/class/usb_device_cdc_acm.h"
 
 #define DATA_OUT (1)
@@ -125,17 +128,66 @@ bool CdcAcm::Transmit(const uint8_t* buffer, const size_t length) {
     return false;
   }
 
+  // A timeout does not cancel the USB transfer. Keep its buffer intact until
+  // its completion arrives, and consume that completion before the next send.
+  if (tx_pending_) {
+    if (xSemaphoreTake(tx_semaphore_, 0) != pdTRUE) {
+      return false;
+    }
+    tx_pending_ = false;
+  }
+
   std::memcpy(tx_buffer_, buffer, length);
-  status = USB_DeviceCdcAcmSend(class_handle_, bulk_in_ep_, tx_buffer_, length);
+  tx_success_ = false;
+  tx_pending_ = true;
+  status = SendData(tx_buffer_, length);
 
   if (status != kStatus_USB_Success) {
     return false;
   }
   if (xSemaphoreTake(tx_semaphore_, pdMS_TO_TICKS(200)) == pdTRUE) {
-    return true;
+    tx_pending_ = false;
+    return tx_success_;
   } else {
     return false;
   }
+}
+
+void CdcAcm::CompleteTransmit(bool success) {
+  if (tx_pending_) {
+    tx_success_ = success;
+    CHECK(xSemaphoreGive(tx_semaphore_) == pdTRUE);
+  }
+}
+
+usb_status_t CdcAcm::SendData(uint8_t* buffer, uint32_t length) {
+  // The class driver's stalled-pipe queue can be discarded on reconfiguration
+  // without a completion. Only accept hardware transfers, checking the stall
+  // state atomically with submission so the USB task cannot halt it in between.
+  taskENTER_CRITICAL();
+  auto* cdc_acm = reinterpret_cast<usb_device_cdc_acm_struct_t*>(class_handle_);
+  usb_status_t status = kStatus_USB_Busy;
+  bool released = true;
+  if (!cdc_acm->bulkIn.pipeStall) {
+    status = USB_DeviceCdcAcmSend(class_handle_, bulk_in_ep_, buffer, length);
+    if (status != kStatus_USB_Success) {
+      // EHCI can return an error after linking a descriptor. Retire it before
+      // releasing the buffer, handling cancellation synchronously like reset
+      // and endpoint deinit so no completion can leak into the next write.
+      auto* device = static_cast<usb_device_struct_t*>(cdc_acm->handle);
+      const auto directly = device->epCallbackDirectly;
+      device->epCallbackDirectly = 1;
+      released = USB_DeviceCancel(cdc_acm->handle, bulk_in_ep_ | (USB_IN << 7)) ==
+                 kStatus_USB_Success;
+      device->epCallbackDirectly = directly;
+    }
+  }
+  if (status != kStatus_USB_Success && released) {
+    xSemaphoreTake(tx_semaphore_, 0);
+    CompleteTransmit(false);
+  }
+  taskEXIT_CRITICAL();
+  return status;
 }
 
 bool CdcAcm::HandleEvent(uint32_t event, void* param) {
@@ -161,15 +213,22 @@ usb_status_t CdcAcm::Handler(uint32_t event, void* param) {
       static_cast<usb_device_cdc_acm_request_param_struct_t*>(param);
   switch (event) {
     case kUSB_DeviceCdcEventSendResponse:
+      if (ep_cb->length == USB_CANCELLED_TRANSFER_LENGTH) {
+        // Endpoint reset/reconfiguration has stopped DMA before this callback.
+        // Release the buffer without reporting a cancelled write as success.
+        CompleteTransmit(false);
+        ret = kStatus_USB_Success;
+        break;
+      }
       if ((ep_cb->length != 0) &&
           (ep_cb->length % cdc_acm_data_endpoints_[DATA_OUT].maxPacketSize) ==
               0) {
         // The packet is equal to the size of the endpoint. Send a zero length
         // packet to let the other side know we're done.
-        ret = USB_DeviceCdcAcmSend(class_handle_, bulk_in_ep_, nullptr, 0);
+        ret = SendData(nullptr, 0);
       } else {
         if (ep_cb->buffer || (!ep_cb->buffer && ep_cb->length == 0)) {
-          CHECK(xSemaphoreGive(tx_semaphore_) == pdTRUE);
+          CompleteTransmit(true);
           ret = USB_DeviceCdcAcmRecv(
               class_handle_, bulk_out_ep_, rx_buffer_,
               cdc_acm_data_endpoints_[DATA_OUT].maxPacketSize);

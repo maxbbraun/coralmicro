@@ -73,6 +73,8 @@ class CdcAcm {
     return handle_map_[class_handle]->Handler(event, param);
   }
   usb_status_t Handler(uint32_t event, void *param);
+  void CompleteTransmit(bool success);
+  usb_status_t SendData(uint8_t *buffer, uint32_t length);
 
   usb_device_endpoint_struct_t cdc_acm_comm_endpoints_[1] = {
       {
@@ -253,6 +255,9 @@ class CdcAcm {
   uint8_t rx_buffer_[512];
   uint8_t serial_state_buffer_[10];
   SemaphoreHandle_t tx_semaphore_;
+  // Only the transmitting task consumes completions and releases this buffer.
+  bool tx_pending_ = false;
+  bool tx_success_ = false;
   uint8_t interrupt_in_ep_, bulk_in_ep_, bulk_out_ep_;
   RxHandler rx_handler_;
   class_handle_t class_handle_;
